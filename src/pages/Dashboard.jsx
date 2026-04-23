@@ -17,10 +17,31 @@ export default function Dashboard({ onSelectStudent }) {
   };
 
   useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      const [studentsData, trendsData, categoriesData, sentimentsData] = await Promise.all([
+        getStudents(),
+        getClassAverageTrends(),
+        getCategoryDistribution(),
+        getSentimentDistribution()
+      ]);
+      setStudents(studentsData);
+      setTrends(trendsData);
+      setCategories(categoriesData);
+      setSentiments(sentimentsData);
+      setLoading(false);
+    };
+
     fetchData();
-    // Poll for updates from Firebase every 10 seconds
-    const interval = setInterval(fetchData, 10000);
-    return () => clearInterval(interval);
+
+    // Listen for sync completion to refresh UI
+    const handleSync = () => {
+      console.log("Sync event received in Dashboard, refreshing data...");
+      fetchData();
+    };
+    window.addEventListener('googleSheetsSynced', handleSync);
+    
+    return () => window.removeEventListener('googleSheetsSynced', handleSync);
   }, []);
 
   if (loading) {

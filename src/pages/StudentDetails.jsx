@@ -9,12 +9,23 @@ export default function StudentDetails({ studentId, onBack }) {
 
   useEffect(() => {
     const fetchStudent = async () => {
-      setLoading(true);
+      // Only show loading on initial fetch to avoid flickering
+      if (!student) setLoading(true);
       const data = await getStudentById(studentId);
       setStudent(data);
       setLoading(false);
     };
+
     fetchStudent();
+
+    // Refresh if data syncs in background
+    const handleSync = () => {
+      console.log(`Sync event in Details for student ${studentId}`);
+      fetchStudent();
+    };
+    window.addEventListener('googleSheetsSynced', handleSync);
+
+    return () => window.removeEventListener('googleSheetsSynced', handleSync);
   }, [studentId]);
 
   if (loading) {

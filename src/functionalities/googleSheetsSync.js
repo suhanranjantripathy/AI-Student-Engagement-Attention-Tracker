@@ -67,30 +67,82 @@ example : 66.8
 
 export const syncGoogleSheets = async () => {
   try {
-    const response = await fetch(SHEET_CSV_URL);
+    console.log("Starting Google Sheets sync...");
+    // Add cache buster to prevent stale data
+    const cacheBuster = `&t=${Date.now()}`;
+    const response = await fetch(SHEET_CSV_URL + cacheBuster);
     const csvText = await response.text();
-    const parsedData = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+    
+    // Parse CSV with header cleaning
+    const parsedData = Papa.parse(csvText, { 
+      header: true, 
+      skipEmptyLines: true,
+      transformHeader: (h) => h.trim() 
+    });
+    
+    console.log(`Parsed ${parsedData.data.length} rows from Google Sheets.`);
     
     const metaRef = doc(db, "system", "syncMeta");
     const metaSnap = await getDoc(metaRef);
-    const lastSyncTime = metaSnap.exists() ? metaSnap.data().lastSyncTime : new Date(0).toISOString();
+    const lastSyncTimeStr = metaSnap.exists() ? metaSnap.data().lastSyncTime : new Date(0).toISOString();
+    const lastSyncTime = new Date(lastSyncTimeStr);
+    
+    console.log(`Last sync time: ${lastSyncTime.toISOString()}`);
     
     let processedAny = false;
-    let latestTimestamp = lastSyncTime;
+    let latestTimestamp = lastSyncTimeStr;
+
+    const findValue = (row, ...keys) => {
+       const rowKeys = Object.keys(row);
+       for (const k of keys) {
+          const match = rowKeys.find(rk => 
+             rk.toLowerCase().replace(/[^a-z0-9]/g, '') === k.toLowerCase().replace(/[^a-z0-9]/g, '')
+          );
+          if (match) return row[match];
+       }
+       return null;
+    };
+
+    const parseDate = (str) => {
+       if (!str) return null;
+       const d = new Date(str);
+       if (!isNaN(d.getTime())) return d;
+       
+       // Handle DD/MM/YYYY format specifically if basic parsing fails
+       const parts = str.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+       if (parts) {
+          // Note: assuming DD/MM/YYYY. If MM/DD/YYYY, swap parts[1] and parts[2]
+          return new Date(parts[3], parts[2] - 1, parts[1]);
+       }
+       return null;
+    };
 
     for (let row of parsedData.data) {
-       const timestamp = row["Timestamp"];
-       if (!timestamp || new Date(timestamp) <= new Date(lastSyncTime)) continue;
+       const timestampStr = findValue(row, "Timestamp", "Time");
+       if (!timestampStr) continue;
        
-       const urn = row["ID"]?.trim();
+       const rowTime = parseDate(timestampStr);
+       
+       if (!rowTime || isNaN(rowTime.getTime())) {
+          console.warn(`Invalid timestamp found: ${timestampStr}`);
+          continue;
+       }
+
+       if (rowTime <= lastSyncTime) {
+          continue; 
+       }
+       
+       const urn = findValue(row, "URN NO", "URN", "ID")?.trim();
        if (!urn) continue;
 
-       // Extra data from sheet
-       const doubt = row["Did you ask any doubts in class?"] || "No";
-       const resolved = row["Did your doubts get resolved properly ?"] || "3";
-       const interest = row["How interested are you in attending the class?"] || "3";
-       const engageRating = row["On the scale out of 1 to 10 how engaged are you in this subject"] || "5";
-       const feedbackText = row["Student's feedback"] || "No feedback";
+       console.log(`Processing new record from ${timestampStr} for student ${urn}`);
+
+       // Extra data from sheet with flexible matching
+       const doubt = findValue(row, "Did you ask any doubts in class?", "Doubts") || "No";
+       const resolved = findValue(row, "Did your doubts get resolved properly ?", "Resolved") || "3";
+       const interest = findValue(row, "How interested are you in attending the class?", "Interest") || "3";
+       const engageRating = findValue(row, "On the scale out of 1 to 10 how engaged are you in this subject", "Engagement", "Rating") || "5";
+       const feedbackText = findValue(row, "Student's feedback", "Feedback") || "No feedback";
 
        // Call AI for EQ
        const eqString = await queryAI(doubt, resolved, interest, engageRating, feedbackText);
@@ -119,42 +171,48 @@ export const syncGoogleSheets = async () => {
            const currentQuizScore = studentData.quizScore || 0;
            const newQuizScore = (currentQuizScore + parseFloat(engageRating)) / 2;
            
-           await updateDoc(studentRef, {
-               participation: newParticipation,
-               quizScore: newQuizScore,
-               engagementScore: eqValue,
-               sentiment: sentiment,
-               category: category,
-               atRisk: atRisk,
-               sentimentHistory: arrayUnion(sentiment),
-               weeklyHistory: arrayUnion(eqValue),
-               feedback: arrayUnion({ date: new Date().toISOString().split('T')[0], text: feedbackText })
-           });
-       } else {
-           await setDoc(studentRef, {
-               id: urn,
-               name: row["NAME"] || "Unknown",
-               participation: 1,
-               quizScore: parseFloat(engageRating) / 2,
-               engagementScore: eqValue,
-               sentiment: sentiment,
-               category: category,
-               atRisk: atRisk,
-               sentimentHistory: [sentiment],
-               weeklyHistory: [eqValue],
-               feedback: [{ date: new Date().toISOString().split('T')[0], text: feedbackText }]
-           }, { merge: true });
-       }
+            await updateDoc(studentRef, {
+                participation: newParticipation,
+                quizScore: newQuizScore,
+                engagementScore: eqValue,
+                sentiment: sentiment,
+                category: category,
+                atRisk: atRisk,
+                sentimentHistory: arrayUnion(sentiment),
+                weeklyHistory: arrayUnion(eqValue),
+                feedback: arrayUnion({ date: timestampStr, text: feedbackText }),
+                latestFeedback: feedbackText
+            });
+        } else {
+            await setDoc(studentRef, {
+                id: urn,
+                name: findValue(row, "NAME", "Student Name", "Name") || "Unknown",
+                participation: 1,
+                quizScore: parseFloat(engageRating) / 2,
+                engagementScore: eqValue,
+                sentiment: sentiment,
+                category: category,
+                atRisk: atRisk,
+                sentimentHistory: [sentiment],
+                weeklyHistory: [eqValue],
+                feedback: [{ date: timestampStr, text: feedbackText }],
+                latestFeedback: feedbackText
+            }, { merge: true });
+        }
        
        processedAny = true;
-       if (new Date(timestamp) > new Date(latestTimestamp)) {
-           latestTimestamp = timestamp;
+       if (rowTime > new Date(latestTimestamp)) {
+           latestTimestamp = timestampStr;
        }
     }
     
     if (processedAny) {
         await setDoc(metaRef, { lastSyncTime: latestTimestamp }, { merge: true });
-        console.log("Synced new Google Sheet records to Firebase.");
+        console.log(`Sync complete. Updated lastSyncTime to ${latestTimestamp}`);
+        // Notify the UI to refresh data
+        window.dispatchEvent(new CustomEvent('googleSheetsSynced'));
+    } else {
+        console.log("No new records to sync.");
     }
 
   } catch (error) {
